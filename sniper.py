@@ -1,13 +1,14 @@
 # Paper-trading SNIPER simulator (NO real money) - brand-new DEX pools
 # $5 per trade, GMGN-like costs, two stop-loss variants side by side (sl20 vs sl35)
+# v2: wider filters, 30-min window, unverified tokens allowed (flagged), funnel counters
 # Data: GeckoTerminal (new pools, prices) + GoPlus (honeypot check). One run per execution.
 import requests, time, json, os, csv
 from datetime import datetime, timezone
 
 GT = "https://api.geckoterminal.com/api/v2"
 GP = "https://api.gopluslabs.io/api/v1"
-STATE = "sniper10_state.json"
-LOG = "sniper10_trades.csv"
+STATE = "sniper11_state.json"
+LOG = "sniper11_trades.csv"
 
 # stop loss % (price move) before the target is reached, per variant
 VARIANTS = {"sl20": -20.0, "sl35": -35.0}
@@ -16,17 +17,19 @@ CFG = dict(
     start_balance=10.0,    # fake dollars per variant
     size=5.0,              # fake dollars per trade
     max_open=2,            # max open trades per variant
-    min_age_min=3,         # pool must be at least this old (minutes) to show sells
-    max_age_min=15,        # ...and at most this old
-    min_liq=6000,          # min pool liquidity (USD)
-    min_buys=10,           # activity in the pool's first 15 minutes
-    min_sells=3,
-    min_sellers=3,         # proof that people could actually sell
+    min_age_min=2,         # pool must be at least this old (minutes) to show sells
+    max_age_min=30,        # ...and at most this old
+    pages=3,               # pages of new pools per network (20 pools each)
+    min_liq=4000,          # min pool liquidity (USD)
+    min_buys=6,            # activity so far (15-min window, 30-min if older)
+    min_sells=2,
+    min_sellers=2,         # proof that people could actually sell
+    allow_unverified=True, # open even if GoPlus has no data yet (flagged in the log)
     max_tax=0.10,          # max buy/sell tax (EVM)
     target_minutes=60,     # must reach the target within this time
     lock=100.0,            # target profit %: once reached, never sell below this
     trail=30.0,            # trailing stop % below the peak after the target
-    max_hold_h=24,         # max hold after the target is reached
+    max_hold_h=6,          # max hold after the target is reached
     fee_pct=1.0,           # GMGN flat fee per side
     slip_pct=1.0,          # slippage per side
     rug_liq_drop=0.2,      # liquidity below 20% of entry = rug, total loss
@@ -90,7 +93,7 @@ def log_trade(row):
         w = csv.writer(f)
         if new:
             w.writerow(["time", "variant", "network", "name", "entry", "exit",
-                        "multiple", "pnl_usd", "reason", "minutes", "hit_target"])
+                        "multiple", "pnl_usd", "reason", "minutes", "hit_target", "sec"])
         w.writerow(row)
 
 
@@ -104,16 +107,17 @@ def parse_pool(p, net):
             a.get("pool_created_at", "").replace("Z", "+00:00")).timestamp()
     except Exception:
         return None
-    tx15 = (a.get("transactions") or {}).get("m15") or {}
+    tx = a.get("transactions") or {}
     return dict(net=net, pool=a.get("address") or "", token=token,
                 name=a.get("name") or "?", created=created,
                 price=fnum(a.get("base_token_price_usd")),
-                liq=fnum(a.get("reserve_in_usd")), tx15=tx15)
+                liq=fnum(a.get("reserve_in_usd")),
+                tx15=tx.get("m15") or {}, tx30=tx.get("m30") or {})
 
 
 def fetch_new(net):
     pools = []
-    for page in (1, 2):
+    for page in range(1, CFG["pages"] + 1):
         data = gt_get("/networks/%s/new_pools" % net, {"page": page})
         for p in (data or {}).get("data", []):
             q = parse_pool(p, net)
@@ -122,8 +126,8 @@ def fetch_new(net):
     return pools
 
 
-def activity_ok(p):
-    t = p["tx15"]
+def activity_ok(p, age):
+    t = p["tx30"] if (age > 15 and p["tx30"]) else p["tx15"]
     return (t.get("buys", 0) >= CFG["min_buys"]
             and t.get("sells", 0) >= CFG["min_sells"]
             and t.get("sellers", 0) >= CFG["min_sellers"])
@@ -188,7 +192,7 @@ def close_pos(v, name, pos, price, reason, mins):
     log_trade([datetime.now().strftime("%m-%d %H:%M"), name, pos["net"],
                pos["name"], pos["entry"], price, round(price / pos["entry"], 2),
                round(value - CFG["size"], 3), reason, round(mins),
-               "yes" if pos["armed"] else "no"])
+               "yes" if pos["armed"] else "no", pos.get("sec", "ok")])
     print("CLOSE %s %s %s x%.2f pnl $%.3f (%s)" % (
         name, pos["net"], pos["name"], price / pos["entry"],
         value - CFG["size"], reason))
@@ -259,16 +263,26 @@ def has_room(v):
 def find_entries(s):
     now = time.time()
     s["seen"] = {k: t for k, t in s["seen"].items() if now - t < 86400}
+    fun = s.setdefault("funnel", {})
     for net, meta in NETS.items():
         if not any(has_room(v) for v in s["v"].values()):
             return
+        f = fun.setdefault(net, dict(fetched=0, age=0, liq=0, act=0, nosec=0,
+                                     unsafe=0, opened=0))
         cands = []
         for p in fetch_new(net):
+            f["fetched"] += 1
             age = (now - p["created"]) / 60
-            if (CFG["min_age_min"] <= age <= CFG["max_age_min"] and p["price"] > 0
-                    and p["liq"] >= CFG["min_liq"] and activity_ok(p)
-                    and p["pool"] not in s["seen"]):
-                cands.append(p)
+            if not (CFG["min_age_min"] <= age <= CFG["max_age_min"] and p["price"] > 0):
+                continue
+            f["age"] += 1
+            if p["liq"] < CFG["min_liq"]:
+                continue
+            f["liq"] += 1
+            if not activity_ok(p, age) or p["pool"] in s["seen"]:
+                continue
+            f["act"] += 1
+            cands.append(p)
         if not cands:
             continue
         toks = [p["token"] for p in cands]
@@ -276,25 +290,33 @@ def find_entries(s):
         for p in cands:
             if net == "solana":
                 ok = sol_safe(info.get(p["token"]))
-                if ok is None and not CFG["solana_need_security"]:
-                    ok = True
             else:
                 ok = evm_safe(info.get(p["token"].lower()))
+            sec = "ok"
             if ok is None:
-                continue  # no security data yet: try again next run
+                if not CFG["allow_unverified"]:
+                    continue  # no security data yet: try again next run
+                ok, sec = True, "unverified"
+                f["nosec"] += 1
             s["seen"][p["pool"]] = now
             if not ok:
+                f["unsafe"] += 1
                 print("SKIP  %s %s (unsafe)" % (net, p["name"]))
                 continue
+            opened_any = False
             for name, v in s["v"].items():
                 if not has_room(v) or any(o["pool"] == p["pool"] for o in v["open"]):
                     continue
                 v["balance"] -= CFG["size"]
                 v["open"].append(dict(net=net, pool=p["pool"], token=p["token"],
                                       name=p["name"], entry=p["price"], t=now,
-                                      liq=p["liq"], peak=p["price"], armed=False, miss=0))
-                print("OPEN  %s %s %s @ %s (liq $%.0f)" % (
-                    name, net, p["name"], p["price"], p["liq"]))
+                                      liq=p["liq"], peak=p["price"], armed=False,
+                                      miss=0, sec=sec))
+                opened_any = True
+                print("OPEN  %s %s %s @ %s (liq $%.0f, %s)" % (
+                    name, net, p["name"], p["price"], p["liq"], sec))
+            if opened_any:
+                f["opened"] += 1
 
 
 def stats(name):
@@ -318,6 +340,9 @@ def main():
         manage_open(v, name, live)
     find_entries(s)
     save(s)
+    for net, f in s.get("funnel", {}).items():
+        print("FUNNEL %s: fetched=%d age=%d liq=%d activity=%d no_security=%d unsafe=%d opened=%d" % (
+            net, f["fetched"], f["age"], f["liq"], f["act"], f["nosec"], f["unsafe"], f["opened"]))
     for name, v in s["v"].items():
         print("%s: cash=$%.2f open=%d | %s" % (name, v["balance"], len(v["open"]), stats(name)))
 
