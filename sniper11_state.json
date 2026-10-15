@@ -1,1 +1,1 @@
-{"seen": {"AScCZFtH7zrAxqm7RnjJBbi1zvVTqmgzbBcAvfxBsBS7": 1791981368.2859242}, "v": {"sl20": {"balance": 0.22485317518129122, "open": []}, "sl35": {"balance": 0.22485317518129122, "open": []}}, "funnel": {"solana": {"fetched": 120, "age": 75, "liq": 9, "act": 7, "nosec": 4, "unsafe": 0, "opened": 3}}}
+{"seen": {}, "v": {"sl20": {"balance": 0.22485317518129122, "open": []}, "sl35": {"balance": 0.22485317518129122, "open": []}}, "funnel": {"solana": {"fetched": 120, "age": 75, "liq": 9, "act": 7, "nosec": 4, "unsafe": 0, "opened": 3}}}
